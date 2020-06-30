@@ -299,6 +299,10 @@ def main(args):
             eval_acc = evaluate(model, g, g.ndata['features'], labels, val_mask, args.batch_size, device)
             print('Eval Acc {:.4f}'.format(eval_acc))
 
+    test_acc = evaluate(model, g, g.ndata['features'], labels, test_mask, args.batch_size, device)
+    print('Test Acc {:.4f}'.format(test_acc))
+    full_acc = evaluate(model, g, g.ndata['features'], labels, full_mask, args.batch_size, device)
+    print('Full Acc {:.4f}'.format(full_acc))
     print('Avg epoch time: {}'.format(avg / (epoch - 4)))
 
 
