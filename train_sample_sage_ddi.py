@@ -17,13 +17,29 @@ import tqdm
 import traceback
 from ogb.nodeproppred.dataset_dgl import DglNodePropPredDataset
 
+from dgl.graph import DGLGraph
+from dgl.contrib.sampling.sampler import NeighborSampler
+from dgl.heterograph import DGLHeteroGraph
 
+
+# 自定义采样器，但是很明显这个采样器并没有很多针对场景的配置，应该可以直接拿到别的地方用
 class NeighborSampler(object):
     def __init__(self, g, fanouts):
+        '''
+        fanout : int or dict[etype, int]
+        The number of sampled neighbors for each node on each edge type. Provide a dict
+        to specify different fanout values for each edge type.
+        定义了每一层的采样规模，比如[10, 25]就是原点采样10个邻居，然后这些邻居再采样他们的25个邻居，也就是说
+        这个地方还定义了采样的层数
+        '''
         self.g = g
         self.fanouts = fanouts
 
     def sample_blocks(self, seeds):
+        '''
+        :param seeds:  采样的中心顶点
+        :return: [由采样出的顶点们构成的子网（未合成版本）]
+        '''
         seeds = th.LongTensor(np.asarray(seeds))
         blocks = []
         for fanout in self.fanouts:
@@ -155,14 +171,70 @@ def load_subtensor(g, labels, seeds, input_nodes, device):
     return batch_inputs, batch_labels
 
 
-#### Entry point
-def run(args, device, data):
-    # Unpack data
-    train_mask, val_mask, in_feats, labels, n_classes, g = data
-    train_nid = th.LongTensor(np.nonzero(train_mask)[0])
-    val_nid = th.LongTensor(np.nonzero(val_mask)[0])
-    train_mask = th.BoolTensor(train_mask)
-    val_mask = th.BoolTensor(val_mask)
+def main(args):
+    # 配置执行器
+    if args.gpu >= 0:
+        device = th.device('cuda:%d' % args.gpu)
+    else:
+        device = th.device('cpu')
+
+    # load data
+    print('----loading dataset----')
+    dataset = DglNodePropPredDataset(name='ogbn-products')
+    dataset_name = dataset.name
+    dataset_task = dataset.task_type
+    print('>>> dataset loaded, name: {}, task: {}'.format(dataset_name, dataset_task))
+
+    print('----processing data for training----')
+    g = dataset.graph[0]
+    features = g.ndata['feat']
+    labels = dataset.labels.squeeze()
+    in_feats = features.shape[1]
+    n_classes = dataset.num_classes
+    n_edges = g.number_of_edges()
+
+    # 数据分割
+    split_idx = dataset.get_idx_split()
+    # nid：[id]，用于构造block（mini-batch）
+    train_nid = split_idx['train']
+    val_nid = split_idx['valid']
+    test_nid = split_idx['test']
+    # mask：[1,0]，用于分割图
+    train_mask = [0] * len(labels)
+    for id in split_idx['train']:
+        train_mask[id] = 1
+    val_mask = [0] * len(labels)
+    for id in split_idx['valid']:
+        val_mask[id] = 1
+    test_mask = [0] * len(labels)
+    for id in split_idx['test']:
+        test_mask[id] = 1
+    full_mask = [1] * len(labels)
+    if hasattr(th, 'BoolTensor'):
+        train_mask = th.BoolTensor(train_mask)
+        val_mask = th.BoolTensor(val_mask)
+        test_mask = th.BoolTensor(test_mask)
+        full_mask = th.BoolTensor(full_mask)
+    else:
+        train_mask = th.ByteTensor(train_mask)
+        val_mask = th.ByteTensor(val_mask)
+        test_mask = th.ByteTensor(test_mask)
+        full_mask = th.ByteTensor(full_mask)
+    print("""----Data statistics------'
+         #Edges %d
+         #Classes %d
+         #Train samples %d
+         #Val samples %d
+         #Test samples %d""" %
+          (n_edges, n_classes,
+           train_mask.int().sum().item(),
+           val_mask.int().sum().item(),
+           test_mask.int().sum().item()))
+
+    # 转为herograph，否则和采样器的api对不起来
+    g = dgl.graph(g.all_edges())
+    g.ndata['features'] = features
+    prepare_mp(g)
 
     # Create sampler
     sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')])
@@ -174,7 +246,7 @@ def run(args, device, data):
         collate_fn=sampler.sample_blocks,
         shuffle=True,
         drop_last=False,
-        num_workers=args.num_workers)
+        num_workers=args.num_workers)  # 此配置了并行采样
 
     # Define model and optimizer
     model = SAGE(in_feats, args.num_hidden, n_classes, args.num_layers, F.relu, args.dropout)
@@ -189,11 +261,13 @@ def run(args, device, data):
     for epoch in range(args.num_epochs):
         tic = time.time()
 
-        # Loop over the dataloader to sample the computation dependency graph as a list of
-        # blocks.
+        # Loop over the dataloader to sample the computation dependency graph as a list of blocks.
         for step, blocks in enumerate(dataloader):
             tic_step = time.time()
 
+            '''
+            此处才真正组成子网，进行minibatch训练
+            '''
             # The nodes for input lies at the LHS side of the first block.
             # The nodes for output lies at the RHS side of the last block.
             input_nodes = blocks[0].srcdata[dgl.NID]
@@ -245,60 +319,4 @@ if __name__ == '__main__':
                            help="Number of sampling processes. Use 0 for no extra process.")
     args = argparser.parse_args()
 
-    if args.gpu >= 0:
-        device = th.device('cuda:%d' % args.gpu)
-    else:
-        device = th.device('cpu')
-
-    # load reddit data
-    print('----loading dataset----')
-    dataset = DglNodePropPredDataset(name='ogbn-products')
-    dataset_name = dataset.name
-    dataset_task = dataset.task_type
-    print('>>> dataset loaded, name: {}, task: {}'.format(dataset_name, dataset_task))
-
-    print('----processing data for training----')
-    split_idx = dataset.get_idx_split()
-    g = dataset.graph[0]
-    prepare_mp(g)
-    features = g.ndata['feat']
-    labels = dataset.labels.squeeze()
-    train_mask = [0] * len(labels)
-    for id in split_idx['train']:
-        train_mask[id] = 1
-    val_mask = [0] * len(labels)
-    for id in split_idx['valid']:
-        val_mask[id] = 1
-    test_mask = [0] * len(labels)
-    for id in split_idx['test']:
-        test_mask[id] = 1
-    full_mask = [1] * len(labels)
-    if hasattr(th, 'BoolTensor'):
-        train_mask = th.BoolTensor(train_mask)
-        val_mask = th.BoolTensor(val_mask)
-        test_mask = th.BoolTensor(test_mask)
-        full_mask = th.BoolTensor(full_mask)
-    else:
-        train_mask = th.ByteTensor(train_mask)
-        val_mask = th.ByteTensor(val_mask)
-        test_mask = th.ByteTensor(test_mask)
-        full_mask = th.ByteTensor(full_mask)
-    in_feats = features.shape[1]
-    n_classes = dataset.num_classes
-    n_edges = g.number_of_edges()
-    print("""----Data statistics------'
-      #Edges %d
-      #Classes %d
-      #Train samples %d
-      #Val samples %d
-      #Test samples %d""" %
-          (n_edges, n_classes,
-           train_mask.int().sum().item(),
-           val_mask.int().sum().item(),
-           test_mask.int().sum().item()))
-
-
-    # Pack data
-    data = train_mask, val_mask, in_feats, labels, n_classes, g
-
-    run(args, device, data)
+    main(args)
