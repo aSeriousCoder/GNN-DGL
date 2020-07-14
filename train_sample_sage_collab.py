@@ -16,9 +16,9 @@ from dgl.utils import check_eq_shape
 from ogb.linkproppred import Evaluator
 from ogb.linkproppred.dataset_dgl import DglLinkPropPredDataset
 from ogb.nodeproppred.dataset_dgl import DglNodePropPredDataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from torch.utils.data import DataLoader
 
 # 自定义采样器，但是很明显这个采样器并没有很多针对场景的配置，应该可以直接拿到别的地方用
 class NeighborSampler(object):
@@ -53,74 +53,6 @@ class NeighborSampler(object):
         return blocks
 
 
-class GraphSAGE(nn.Module):
-    def __init__(self,
-                 g,
-                 in_feats,
-                 n_hidden,
-                 n_classes,
-                 n_layers,
-                 activation,
-                 dropout,
-                 aggregator_type):
-        super(GraphSAGE, self).__init__()
-        self.layers = nn.ModuleList()
-        self.g = g
-
-        # input layer
-        self.layers.append(SAGEConv(
-            in_feats, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
-        # hidden layers
-        for i in range(n_layers - 1):
-            self.layers.append(SAGEConv(
-                n_hidden, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
-        # output layer
-        self.layers.append(
-            SAGEConv(n_hidden, n_classes, aggregator_type, feat_drop=dropout, activation=None))  # activation None
-
-    def forward(self, features):
-        h = features
-        for layer in self.layers:
-            h = layer(self.g, h)
-        return h
-
-    def inference(self, g, x, batch_size, device):
-        """
-        Inference with the GraphSAGE model on full neighbors (i.e. without neighbor sampling).
-        g : the entire graph.
-        x : the input of entire node set.
-        The inference code is written in a fashion that it could handle any number of nodes and
-        layers.
-        """
-        # During inference with sampling, multi-layer blocks are very inefficient because
-        # lots of computations in the first few layers are repeated.
-        # Therefore, we compute the representation of all nodes layer by layer.  The nodes
-        # on each layer are of course splitted in batches.
-        # TODO: can we standardize this?
-        nodes = torch.arange(g.number_of_nodes())
-        for l, layer in enumerate(self.layers):
-            y = torch.zeros(g.number_of_nodes(), self.n_hidden if l !=
-                         len(self.layers) - 1 else self.n_classes)
-
-            for start in tqdm.trange(0, len(nodes), batch_size):
-                end = start + batch_size
-                batch_nodes = nodes[start:end]
-                block = dgl.to_block(dgl.in_subgraph(
-                    g, batch_nodes), batch_nodes)
-                input_nodes = block.srcdata[dgl.NID]
-
-                h = x[input_nodes].to(device)
-                h_dst = h[:block.number_of_dst_nodes()]
-                h = layer(block, (h, h_dst))
-                if l != len(self.layers) - 1:
-                    h = self.activation(h)
-                    h = self.dropout(h)
-
-                y[start:end] = h.cpu()
-
-            x = y
-        return y
-
 
 def prepare_mp(g):
     """
@@ -152,13 +84,12 @@ def evaluate(model, features, labels, mask):
         return correct.item() * 1.0 / len(labels)
 
 
-def load_subtensor(g, labels, seeds, input_nodes, device):
+def load_subtensor(g, seeds, input_nodes):
     """
     Copys features and labels of a set of nodes onto GPU.
     """
-    batch_inputs = g.ndata['features'][input_nodes].to(device)
-    batch_labels = labels[seeds].to(device)
-    return batch_inputs, batch_labels
+    batch_inputs = g.ndata['feat'][input_nodes]
+    return batch_inputs
 
 
 class SAGEConvLink(SAGEConv):
@@ -234,23 +165,79 @@ class GraphSAGE(nn.Module):
         super(GraphSAGE, self).__init__()
         self.layers = nn.ModuleList()
         self.g = g
+        self.activation = activation
+        self.dropout = dropout
 
         # input layer
-        self.layers.append(SAGEConvLink(
+        self.layers.append(SAGEConv(
             in_feats, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
         # hidden layers
         for i in range(n_layers - 1):
-            self.layers.append(
-                SAGEConvLink(n_hidden, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
+            self.layers.append(SAGEConv(
+                n_hidden, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
         # output layer
         self.layers.append(
             SAGEConv(n_hidden, n_classes, aggregator_type, feat_drop=dropout, activation=None))  # activation None
 
-    def forward(self, features):
-        h = features
-        for layer in self.layers:
-            h = layer(self.g, h)
+    def forward(self, blocks, x):
+        h = x
+        '''
+        显然一个block是一个单层网
+        '''
+        for l, (layer, block) in enumerate(zip(self.layers, blocks)):
+            # We need to first copy the representation of nodes on the RHS from the
+            # appropriate nodes on the LHS.
+            # Note that the shape of h is (num_nodes_LHS, D) and the shape of h_dst
+            # would be (num_nodes_RHS, D)
+            h_dst = h[:block.number_of_dst_nodes()]
+            # Then we compute the updated representation on the RHS.
+            # The shape of h now becomes (num_nodes_RHS, D)
+            h = layer(block, (h, h_dst))
+            if l != len(self.layers) - 1:
+                if self.activation:
+                    h = self.activation(h)
+                if self.dropout:
+                    h = self.dropout(h)
         return h
+
+    def inference(self, g, x, batch_size):
+        """
+        Inference with the GraphSAGE model on full neighbors (i.e. without neighbor sampling).
+        g : the entire graph.
+        x : the input of entire node set.
+        The inference code is written in a fashion that it could handle any number of nodes and
+        layers.
+        """
+        # During inference with sampling, multi-layer blocks are very inefficient because
+        # lots of computations in the first few layers are repeated.
+        # Therefore, we compute the representation of all nodes layer by layer.  The nodes
+        # on each layer are of course splitted in batches.
+        # TODO: can we standardize this?
+        nodes = torch.arange(g.number_of_nodes())
+        for l, layer in enumerate(self.layers):
+            y = torch.zeros(g.number_of_nodes(), self.n_hidden if l !=
+                            len(self.layers) - 1 else self.n_classes)
+
+            for start in tqdm.trange(0, len(nodes), batch_size):
+                end = start + batch_size
+                batch_nodes = nodes[start:end]
+                block = dgl.to_block(dgl.in_subgraph(
+                    g, batch_nodes), batch_nodes)
+                input_nodes = block.srcdata[dgl.NID]
+
+                h = x[input_nodes]
+                h_dst = h[:block.number_of_dst_nodes()]
+                h = layer(block, (h, h_dst))
+                if l != len(self.layers) - 1:
+                    h = self.activation(h)
+                    h = self.dropout(h)
+
+                y[start:end] = h.cpu()
+
+            x = y
+        return y
+
+
 
 
 class LinkPredictor(torch.nn.Module):
@@ -280,42 +267,61 @@ class LinkPredictor(torch.nn.Module):
         return torch.sigmoid(x)
 
 
-def train(model, predictor, graph, split_edge, optimizer):
+def train(model, predictor, graph, split_edge, optimizer, dataloader):
     model.train()
     predictor.train()
 
-    x = graph.ndata['feat']
+    # Loop over the dataloader to sample the computation dependency graph as a list of blocks.
+    for step, blocks in enumerate(dataloader):
 
-    pos_train_edge = split_edge['train']['edge']
+        '''
+        此处才真正组成子网，进行minibatch训练
+        '''
+        # The nodes for input lies at the LHS side of the first block.
+        # The nodes for output lies at the RHS side of the last block.
+        input_nodes = blocks[0].srcdata[dgl.NID]
+        seeds = blocks[-1].dstdata[dgl.NID]
+        batch_inputs = load_subtensor(graph, seeds, input_nodes)
 
-    optimizer.zero_grad()
+        optimizer.zero_grad()
 
-    h = model(x)
+        '''
+        id可能还有一些问题
+        edge的形式也有问题
+        '''
 
-    edge = pos_train_edge.t()
+        # Compute loss and prediction
+        batch_pred = model(blocks, batch_inputs)
 
-    pos_out = predictor(h[edge[0]], h[edge[1]])
-    pos_loss = -torch.log(pos_out + 1e-15).mean()
+        ''''
+        把种子们的邻居找出来，用这些边进入下一轮学习
+        '''
+        edges_from_seed = blocks[-1].edges()
+        edges_for_neg_sample = []
+        for block in blocks[:-1]:
+            edges_for_neg_sample += block.edges()
 
-    # Just do some trivial random sampling.
-    edge = torch.randint(0, x.size(0), edge.size(), dtype=torch.long,
-                         device=x.device)
-    neg_out = predictor(h[edge[0]], h[edge[1]])
-    neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
+        pos_out = predictor(batch_pred[edges_from_seed[0]], batch_pred[edges_from_seed[1]])
+        pos_loss = -torch.log(pos_out + 1e-15).mean()
 
-    loss = pos_loss + neg_loss
-    loss.backward()
+        # Just do some trivial random sampling.
+        edge_neg = torch.randint(0, len(edges_for_neg_sample), edges_from_seed.size(), dtype=torch.long)
+        neg_out = predictor(batch_pred[edge_neg[0]], batch_pred[edge_neg[1]])
+        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
+        loss = pos_loss + neg_loss
+        loss.backward()
 
-    optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
+
+        optimizer.step()
 
     return loss.item()
 
 
 @torch.no_grad()
-def test(model, predictor, graph, split_edge, evaluator):
+def test(model, predictor, graph, split_edge, evaluator, dataloader):
     model.eval()
     predictor.eval()
 
@@ -385,11 +391,12 @@ def main(args):
     prepare_mp(g)
 
     # Create sampler
-    sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')])
+    sampler = NeighborSampler(g, [int(fanout)
+                                  for fanout in args.fan_out.split(',')])
 
     # Create PyTorch DataLoader for constructing blocks
     dataloader = DataLoader(
-        dataset=train_nid.numpy(),
+        dataset=np.array(range(g.number_of_nodes())),
         batch_size=args.batch_size,
         collate_fn=sampler.sample_blocks,
         shuffle=True,
@@ -411,11 +418,11 @@ def main(args):
     print('----Training----')
     for epoch in range(1, 1 + args.epochs):
         t0 = time.time()
-        loss = train(model, predictor, graph, split_edge, optimizer)
+        loss = train(model, predictor, graph, split_edge, optimizer, dataloader)
         t1 = time.time()
 
         if epoch % args.eval_steps == 0 or epoch == args.epochs:
-            results = test(model, predictor, graph, split_edge, evaluator)
+            results = test(model, predictor, graph, split_edge, evaluator, dataloader)
             for key, result in results.items():
                 train_hits, valid_hits, test_hits = result
                 print(key)
@@ -438,6 +445,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval_steps', type=int, default=1)
     parser.add_argument('--fan-out', type=str, default='10,25')
     parser.add_argument('--batch-size', type=int, default=1000)
+    parser.add_argument('--num_workers', type=int, default=1)
     args = parser.parse_args()
     print(args)
 
