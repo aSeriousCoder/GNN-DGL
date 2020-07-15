@@ -1,6 +1,7 @@
 import argparse
 import time
 from logging import Logger
+from random import randint
 
 import dgl
 import dgl.function as fn
@@ -10,6 +11,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from dgl import DGLError, DGLHeteroGraph
 from dgl.data import register_data_args
 from dgl.nn.pytorch.conv import SAGEConv
 from dgl.utils import check_eq_shape
@@ -18,6 +20,10 @@ from ogb.linkproppred.dataset_dgl import DglLinkPropPredDataset
 from ogb.nodeproppred.dataset_dgl import DglNodePropPredDataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from dgl import utils
+from dgl import ndarray as nd
+
+
 
 
 # 自定义采样器，但是很明显这个采样器并没有很多针对场景的配置，应该可以直接拿到别的地方用
@@ -53,7 +59,6 @@ class NeighborSampler(object):
         return blocks
 
 
-
 def prepare_mp(g):
     """
     Explicitly materialize the CSR, CSC and COO representation of the given graph
@@ -84,12 +89,13 @@ def evaluate(model, features, labels, mask):
         return correct.item() * 1.0 / len(labels)
 
 
-def load_subtensor(g, seeds, input_nodes):
+def load_subtensor(g, input_nodes_l1, input_nodes_l0):
     """
     Copys features and labels of a set of nodes onto GPU.
     """
-    batch_inputs = g.ndata['feat'][input_nodes]
-    return batch_inputs
+    batch_inputs_l1 = g.ndata['feat'][input_nodes_l1]
+    batch_inputs_l0 = g.ndata['feat'][input_nodes_l0]
+    return batch_inputs_l1, batch_inputs_l0
 
 
 class SAGEConvLink(SAGEConv):
@@ -179,12 +185,12 @@ class GraphSAGE(nn.Module):
         self.layers.append(
             SAGEConv(n_hidden, n_classes, aggregator_type, feat_drop=dropout, activation=None))  # activation None
 
-    def forward(self, blocks, x):
-        h = x
+    def forward(self, blocks, x_l1, x_l0):
+        h = x_l1
         '''
         显然一个block是一个单层网
         '''
-        for l, (layer, block) in enumerate(zip(self.layers, blocks)):
+        for l, (layer, block) in enumerate(zip(self.layers, blocks[:-1])):
             # We need to first copy the representation of nodes on the RHS from the
             # appropriate nodes on the LHS.
             # Note that the shape of h is (num_nodes_LHS, D) and the shape of h_dst
@@ -198,7 +204,29 @@ class GraphSAGE(nn.Module):
                     h = self.activation(h)
                 if self.dropout:
                     h = self.dropout(h)
-        return h
+        h_neib = h
+
+        h = x_l0
+        '''
+        显然一个block是一个单层网
+        '''
+        for l, (layer, block) in enumerate(zip(self.layers, blocks[1:])):
+            # We need to first copy the representation of nodes on the RHS from the
+            # appropriate nodes on the LHS.
+            # Note that the shape of h is (num_nodes_LHS, D) and the shape of h_dst
+            # would be (num_nodes_RHS, D)
+            h_dst = h[:block.number_of_dst_nodes()]
+            # Then we compute the updated representation on the RHS.
+            # The shape of h now becomes (num_nodes_RHS, D)
+            h = layer(block, (h, h_dst))
+            if l != len(self.layers) - 1:
+                if self.activation:
+                    h = self.activation(h)
+                if self.dropout:
+                    h = self.dropout(h)
+        h_seed = h
+
+        return h_seed, h_neib
 
     def inference(self, g, x, batch_size):
         """
@@ -216,7 +244,7 @@ class GraphSAGE(nn.Module):
         nodes = torch.arange(g.number_of_nodes())
         for l, layer in enumerate(self.layers):
             y = torch.zeros(g.number_of_nodes(), self.n_hidden if l !=
-                            len(self.layers) - 1 else self.n_classes)
+                                                                  len(self.layers) - 1 else self.n_classes)
 
             for start in tqdm.trange(0, len(nodes), batch_size):
                 end = start + batch_size
@@ -236,8 +264,6 @@ class GraphSAGE(nn.Module):
 
             x = y
         return y
-
-
 
 
 class LinkPredictor(torch.nn.Module):
@@ -279,9 +305,9 @@ def train(model, predictor, graph, split_edge, optimizer, dataloader):
         '''
         # The nodes for input lies at the LHS side of the first block.
         # The nodes for output lies at the RHS side of the last block.
-        input_nodes = blocks[0].srcdata[dgl.NID]
-        seeds = blocks[-1].dstdata[dgl.NID]
-        batch_inputs = load_subtensor(graph, seeds, input_nodes)
+        input_nodes_l1 = blocks[0].srcdata[dgl.NID]
+        input_nodes_l0 = blocks[1].srcdata[dgl.NID]
+        batch_inputs_l1, batch_inputs_l0 = load_subtensor(graph, input_nodes_l1, input_nodes_l0)
 
         optimizer.zero_grad()
 
@@ -291,22 +317,31 @@ def train(model, predictor, graph, split_edge, optimizer, dataloader):
         '''
 
         # Compute loss and prediction
-        batch_pred = model(blocks, batch_inputs)
+        seed_pred, neib_pred = model(blocks, batch_inputs_l1, batch_inputs_l0)
+        pred = neib_pred
+        pred[:len(seed_pred)] = seed_pred
 
         ''''
         把种子们的邻居找出来，用这些边进入下一轮学习
         '''
         edges_from_seed = blocks[-1].edges()
-        edges_for_neg_sample = []
-        for block in blocks[:-1]:
-            edges_for_neg_sample += block.edges()
 
-        pos_out = predictor(batch_pred[edges_from_seed[0]], batch_pred[edges_from_seed[1]])
+        pos_out = predictor(pred[edges_from_seed[0]], pred[edges_from_seed[1]])
         pos_loss = -torch.log(pos_out + 1e-15).mean()
 
         # Just do some trivial random sampling.
-        edge_neg = torch.randint(0, len(edges_for_neg_sample), edges_from_seed.size(), dtype=torch.long)
-        neg_out = predictor(batch_pred[edge_neg[0]], batch_pred[edge_neg[1]])
+        g = blocks[-3]
+        num_of_node = blocks[-2].number_of_dst_nodes('_N')
+        edge_neg = [[], []]
+        while len(edge_neg[0]) < len(edges_from_seed[0]):
+            node1 = randint(0, num_of_node-1)
+            node2 = randint(0, num_of_node-1)
+            while node2 == node1:
+                node2 = randint(0, num_of_node)
+            if not g.has_edge_between(node1, node2, '_E'):
+                edge_neg[0].append(node1)
+                edge_neg[1].append(node2)
+        neg_out = predictor(pred[edge_neg[0]], pred[edge_neg[1]])
         neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
 
         loss = pos_loss + neg_loss
@@ -443,7 +478,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--eval_steps', type=int, default=1)
-    parser.add_argument('--fan-out', type=str, default='10,25')
+    parser.add_argument('--fan-out', type=str, default='10,10,10,10,10')
     parser.add_argument('--batch-size', type=int, default=1000)
     parser.add_argument('--num_workers', type=int, default=1)
     args = parser.parse_args()
