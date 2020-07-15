@@ -24,8 +24,6 @@ from dgl import utils
 from dgl import ndarray as nd
 
 
-
-
 # 自定义采样器，但是很明显这个采样器并没有很多针对场景的配置，应该可以直接拿到别的地方用
 class NeighborSampler(object):
     def __init__(self, g, fanouts):
@@ -228,42 +226,11 @@ class GraphSAGE(nn.Module):
 
         return h_seed, h_neib
 
-    def inference(self, g, x, batch_size):
-        """
-        Inference with the GraphSAGE model on full neighbors (i.e. without neighbor sampling).
-        g : the entire graph.
-        x : the input of entire node set.
-        The inference code is written in a fashion that it could handle any number of nodes and
-        layers.
-        """
-        # During inference with sampling, multi-layer blocks are very inefficient because
-        # lots of computations in the first few layers are repeated.
-        # Therefore, we compute the representation of all nodes layer by layer.  The nodes
-        # on each layer are of course splitted in batches.
-        # TODO: can we standardize this?
-        nodes = torch.arange(g.number_of_nodes())
-        for l, layer in enumerate(self.layers):
-            y = torch.zeros(g.number_of_nodes(), self.n_hidden if l !=
-                                                                  len(self.layers) - 1 else self.n_classes)
-
-            for start in tqdm.trange(0, len(nodes), batch_size):
-                end = start + batch_size
-                batch_nodes = nodes[start:end]
-                block = dgl.to_block(dgl.in_subgraph(
-                    g, batch_nodes), batch_nodes)
-                input_nodes = block.srcdata[dgl.NID]
-
-                h = x[input_nodes]
-                h_dst = h[:block.number_of_dst_nodes()]
-                h = layer(block, (h, h_dst))
-                if l != len(self.layers) - 1:
-                    h = self.activation(h)
-                    h = self.dropout(h)
-
-                y[start:end] = h.cpu()
-
-            x = y
-        return y
+    def inference(self, x, ):
+        h = x
+        for layer in self.layers:
+            h = layer(self.g, h)
+        return h
 
 
 class LinkPredictor(torch.nn.Module):
@@ -298,7 +265,7 @@ def train(model, predictor, graph, split_edge, optimizer, dataloader):
     predictor.train()
 
     # Loop over the dataloader to sample the computation dependency graph as a list of blocks.
-    for step, blocks in enumerate(dataloader):
+    for step, blocks in tqdm(enumerate(dataloader)):
 
         '''
         此处才真正组成子网，进行minibatch训练
@@ -334,8 +301,8 @@ def train(model, predictor, graph, split_edge, optimizer, dataloader):
         num_of_node = blocks[-2].number_of_dst_nodes('_N')
         edge_neg = [[], []]
         while len(edge_neg[0]) < len(edges_from_seed[0]):
-            node1 = randint(0, num_of_node-1)
-            node2 = randint(0, num_of_node-1)
+            node1 = randint(0, num_of_node - 1)
+            node2 = randint(0, num_of_node - 1)
             while node2 == node1:
                 node2 = randint(0, num_of_node)
             if not g.has_edge_between(node1, node2, '_E'):
@@ -362,7 +329,7 @@ def test(model, predictor, graph, split_edge, evaluator, dataloader):
 
     x = graph.ndata['feat']
 
-    h = model(x)
+    h = model.inference(x)
 
     pos_train_edge = split_edge['train']['edge']
     pos_valid_edge = split_edge['valid']['edge']
