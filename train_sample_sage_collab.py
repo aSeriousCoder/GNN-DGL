@@ -1,27 +1,18 @@
 import argparse
 import time
-from logging import Logger
 from random import randint
-
 import dgl
 import dgl.function as fn
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from dgl import DGLError, DGLHeteroGraph
-from dgl.data import register_data_args
 from dgl.nn.pytorch.conv import SAGEConv
 from dgl.utils import check_eq_shape
 from ogb.linkproppred import Evaluator
 from ogb.linkproppred.dataset_dgl import DglLinkPropPredDataset
-from ogb.nodeproppred.dataset_dgl import DglNodePropPredDataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from dgl import utils
-from dgl import ndarray as nd
 
 
 # 自定义采样器，但是很明显这个采样器并没有很多针对场景的配置，应该可以直接拿到别的地方用

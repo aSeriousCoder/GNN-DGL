@@ -44,5 +44,35 @@
 
 
 
+## 实验结论
+
+还是**可以用**的，但是OGB和DGL的对接有一些麻烦（三个集合的分割使用反面，不过我觉得这个无法避免）。后面可以考虑出一个DGL+OGB图神经网络编程指导文档。
+
+
+
 ## 运行结果
+
+```bash
+Using backend: pytorch
+Namespace(batch_size=1000, dropout=0.0, epochs=200, eval_steps=1, fan_out='10,10,10,10,10', hidden_channels=128, lr=0.001, num_layers=3, num_workers=1)
+----loading dataset----
+>>> dataset loaded, name: ogbl-collab, task: link prediction
+----Building Models----
+----Training----
+236it [05:05,  1.29s/it]
+Hits@10
+Epoch: 01, Loss: 0.2169, Train: 4.87%, Valid: 1.53%, Test: 0.85%Epoch Time: 305.38556599617004
+Hits@50
+Epoch: 01, Loss: 0.2169, Train: 11.17%, Valid: 3.87%, Test: 2.54%Epoch Time: 305.38556599617004
+Hits@100
+Epoch: 01, Loss: 0.2169, Train: 16.35%, Valid: 6.10%, Test: 4.36%Epoch Time: 305.38556599617004
+------
+236it [04:57,  1.26s/it]
+Hits@10
+Epoch: 02, Loss: 0.1558, Train: 7.92%, Valid: 2.42%, Test: 1.49%Epoch Time: 297.9256718158722
+Hits@50
+Epoch: 02, Loss: 0.1558, Train: 16.84%, Valid: 6.00%, Test: 4.16%Epoch Time: 297.9256718158722
+Hits@100
+Epoch: 02, Loss: 0.1558, Train: 25.86%, Valid: 10.37%, Test: 7.69%Epoch Time: 297.9256718158722
+```
 
