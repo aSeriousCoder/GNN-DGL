@@ -20,18 +20,22 @@ class GraphSAGE(nn.Module):
                  dropout,
                  aggregator_type):
         super(GraphSAGE, self).__init__()
-        self.layers = nn.ModuleList()
-        self.g = g
+        self.layers = nn.ModuleList()  # 设置模组流水线
+        self.g = g  # 倒入数据集
 
         # input layer
-        self.layers.append(SAGEConv(in_feats, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
+        self.layers.append(
+            SAGEConv(in_feats, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
         # hidden layers
         for i in range(n_layers - 1):
-            self.layers.append(SAGEConv(n_hidden, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
+            self.layers.append(
+                SAGEConv(n_hidden, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
         # output layer
         self.layers.append(
-            SAGEConv(n_hidden, n_classes, aggregator_type, feat_drop=dropout, activation=None))  # activation None
+            SAGEConv(n_hidden, n_classes, aggregator_type, feat_drop=dropout, activation=None))
+        # 以上都使用了DGL封装好的SAGEConv层，也可以自定义
 
+    # 手动定义forward函数
     def forward(self, features):
         h = features
         for layer in self.layers:
@@ -40,7 +44,7 @@ class GraphSAGE(nn.Module):
 
 
 def evaluate(model, features, labels, mask):
-    model.eval()
+    model.eval()  # 开启测试模式
     with torch.no_grad():
         logits = model(features)
         logits = logits[mask]
@@ -51,17 +55,25 @@ def evaluate(model, features, labels, mask):
 
 
 def main(args):
-    # load and preprocess dataset
+
+    # step.1 load and preprocess dataset
+
+    # 此处为从OGB直接获取数据集
+    # 数据集较大，需要下载一段时间
     print('----loading dataset----')
     dataset = DglNodePropPredDataset(name='ogbn-products')
     dataset_name = dataset.name
     dataset_task = dataset.task_type
-    print('>>> dataset loaded, name: {}, task: {}'.format(dataset_name, dataset_task))
+    print('>>> dataset loaded, name: {}, task: {}'.format(
+        dataset_name, dataset_task))
 
     print('----processing data for training----')
+    # 在node prediction任务中，train-test-valid的划分使用mask来进行，此处便是获取OGB分好的数据划分
     split_idx = dataset.get_idx_split()
-    g = dataset.graph[0]
+    g = dataset.graph[0]  # 由于是node prediction任务，整个数据集就只有一张图
     features = g.ndata['feat']
+
+    # 构造mask
     labels = dataset.labels.squeeze()
     train_mask = [0] * len(labels)
     for id in split_idx['train']:
@@ -73,6 +85,8 @@ def main(args):
     for id in split_idx['test']:
         test_mask[id] = 1
     full_mask = [1] * len(labels)
+
+    # 一些配置
     if hasattr(torch, 'BoolTensor'):
         train_mask = torch.BoolTensor(train_mask)
         val_mask = torch.BoolTensor(val_mask)
@@ -109,9 +123,8 @@ def main(args):
         test_mask = test_mask.cuda()
         print("use cuda:", args.gpu)
 
+    # Step.2 create learning model, loss function and optimizer
 
-
-    # create GraphSAGE model
     print('----building train model----')
     model = GraphSAGE(g,
                       in_feats,
@@ -125,25 +138,26 @@ def main(args):
 
     if cuda:
         model.cuda()
+
+    # 使用封装好的loss function，也可以自定义
     loss_fcn = torch.nn.CrossEntropyLoss()
 
     # use optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # initialize graph
+    # Step.3 Training
+
     print('----train start----')
     dur = []
     for epoch in range(args.n_epochs):
-        model.train()
+        model.train()  # 开启训练模式
         t0 = time.time()
-        # forward
-        logits = model(features)
+        logits = model(features)  # forward
         loss = loss_fcn(logits[train_mask], labels[train_mask])
-
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
         t1 = time.time()
         dur.append(t1 - t0)
 
@@ -163,9 +177,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='GraphSAGE')
     register_data_args(parser)
     parser.add_argument("--dropout", type=float, default=0.5,
-                        help="dropout probability")
+                        help="dropout probability")  # 弃用率，模拟消息传递过程中的随机损失
     parser.add_argument("--gpu", type=int, default=-1,
-                        help="gpu")
+                        help="gpu")  # 默认不适用GPU
     parser.add_argument("--lr", type=float, default=1e-2,
                         help="learning rate")
     parser.add_argument("--n-epochs", type=int, default=100,
@@ -177,7 +191,7 @@ if __name__ == '__main__':
     parser.add_argument("--weight-decay", type=float, default=5e-4,
                         help="Weight for L2 loss")
     parser.add_argument("--aggregator-type", type=str, default="gcn",
-                        help="Aggregator type: mean/gcn/pool/lstm")
+                        help="Aggregator type: mean/gcn/pool/lstm")  # aggregate funcion选用的算法
     args = parser.parse_args()
     print(args)
 

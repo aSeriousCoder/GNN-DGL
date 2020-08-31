@@ -24,18 +24,20 @@ class SAGEConvLink(SAGEConv):
 
         h_self = feat_dst
 
+        # 自定义的消息传播函数
         def message_func(edges):
-            weights = edges.data['edge_weight']
+            weights = edges.data['edge_weight']  # 带权图使用link weight对消息进行加权
             src_data = edges.src['h']
             return_data = src_data * weights
             return {'m': return_data}
 
+        # 自定义的消息聚合函数，此处没有使用
         def reduce_func(nodes):
             pass
 
         if self._aggre_type == 'mean':
             graph.srcdata['h'] = feat_src
-            graph.update_all(message_func, fn.mean('m', 'neigh'))
+            graph.update_all(message_func, fn.mean('m', 'neigh'))  # 缓存的名字必须对应
             h_neigh = graph.dstdata['neigh']
         elif self._aggre_type == 'gcn':
             check_eq_shape(feat)
@@ -44,7 +46,8 @@ class SAGEConvLink(SAGEConv):
             graph.update_all(message_func, fn.sum('m', 'neigh'))
             # divide in_degrees
             degs = graph.in_degrees().to(feat_dst)
-            h_neigh = (graph.dstdata['neigh'] + graph.dstdata['h']) / (degs.unsqueeze(-1) + 1)
+            h_neigh = (graph.dstdata['neigh'] +
+                       graph.dstdata['h']) / (degs.unsqueeze(-1) + 1)
         elif self._aggre_type == 'pool':
             graph.srcdata['h'] = F.relu(self.fc_pool(feat_src))
             graph.update_all(message_func, fn.max('m', 'neigh'))
@@ -54,7 +57,8 @@ class SAGEConvLink(SAGEConv):
             graph.update_all(message_func, self._lstm_reducer)
             h_neigh = graph.dstdata['neigh']
         else:
-            raise KeyError('Aggregator type {} not recognized.'.format(self._aggre_type))
+            raise KeyError(
+                'Aggregator type {} not recognized.'.format(self._aggre_type))
 
         # GraphSAGE GCN does not require fc_self.
         if self._aggre_type == 'gcn':
@@ -85,7 +89,8 @@ class GraphSAGE(nn.Module):
         self.g = g
 
         # input layer
-        self.layers.append(SAGEConvLink(in_feats, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
+        self.layers.append(SAGEConvLink(
+            in_feats, n_hidden, aggregator_type, feat_drop=dropout, activation=activation))
         # hidden layers
         for i in range(n_layers - 1):
             self.layers.append(
@@ -100,8 +105,35 @@ class GraphSAGE(nn.Module):
             h = layer(self.g, h)
         return h
 
+# 一个简单的神经网络，用于预测两点之间是否有边
+
 
 class LinkPredictor(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
+                 dropout):
+        super(LinkPredictor, self).__init__()
+
+        self.lins = torch.nn.ModuleList()
+        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
+        for _ in range(num_layers - 2):
+            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
+        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
+
+        self.dropout = dropout
+
+    def reset_parameters(self):
+        for lin in self.lins:
+            lin.reset_parameters()
+
+    def forward(self, x_i, x_j):
+        x = x_i * x_j  # 使用两个embedding的乘积作为单输入
+        for lin in self.lins[:-1]:
+            x = lin(x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.lins[-1](x)
+        return torch.sigmoid(x)
+
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
                  dropout):
         super(LinkPredictor, self).__init__()
@@ -214,7 +246,9 @@ def test(model, predictor, graph, split_edge, evaluator):
 
 
 def main(args):
-    # load and preprocess dataset
+
+    # Step.1 load and preprocess dataset
+
     print('----loading dataset----')
     dataset = DglLinkPropPredDataset(name='ogbl-collab')
     dataset_name = dataset.name
@@ -222,14 +256,18 @@ def main(args):
     split_edge = dataset.get_edge_split()
     graph = dataset[0]
     x = graph.ndata['feat']
-    print('>>> dataset loaded, name: {}, task: {}'.format(dataset_name, dataset_task))
+    print('>>> dataset loaded, name: {}, task: {}'.format(
+        dataset_name, dataset_task))
+
+    # Step.2 配置模型
 
     print('----Building Models----')
 
-    model = GraphSAGE(g=graph, in_feats=x.size(-1), n_hidden=args.hidden_channels, n_classes=args.hidden_channels,
+    model = GraphSAGE(g=graph, in_feats=x.size(-1), n_hidden=args.hidden_channels,  n_classes=args.hidden_channels,
                       n_layers=args.num_layers, activation=None, dropout=args.dropout, aggregator_type='gcn')
 
-    predictor = LinkPredictor(args.hidden_channels, args.hidden_channels, 1, args.num_layers, args.dropout)
+    predictor = LinkPredictor(
+        args.hidden_channels, args.hidden_channels, 1, args.num_layers, args.dropout)
 
     evaluator = Evaluator(name='ogbl-collab')
 

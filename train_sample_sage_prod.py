@@ -38,18 +38,18 @@ class NeighborSampler(object):
     def sample_blocks(self, seeds):
         '''
         :param seeds:  采样的中心顶点
-        :return: [由采样出的顶点们构成的子网（未合成版本）]
+        :return: [由采样出的顶点们构成的子网（未合成版本)]，即[(二阶邻居+一阶邻居+seed，一阶邻居+seed), (一阶邻居+seed，seed)]
         '''
         seeds = th.LongTensor(np.asarray(seeds))
         blocks = []
         for fanout in self.fanouts:
             # For each seed node, sample ``fanout`` neighbors.
-            frontier = dgl.sampling.sample_neighbors(self.g, seeds, fanout, replace=True)
+            frontier = dgl.sampling.sample_neighbors(
+                self.g, seeds, fanout, replace=True)
             # Then we compact the frontier into a bipartite graph for message passing.
             block = dgl.to_block(frontier, seeds)
             # Obtain the seed nodes for next layer.
             seeds = block.srcdata[dgl.NID]
-
             blocks.insert(0, block)
         return blocks
 
@@ -67,6 +67,7 @@ class SAGE(nn.Module):
         self.n_hidden = n_hidden
         self.n_classes = n_classes
         self.layers = nn.ModuleList()
+        # 此处仍然使用DGL封装好的层，聚合函数写死为“mean”，也可以像之前的版本进行变化
         self.layers.append(dglnn.SAGEConv(in_feats, n_hidden, 'mean'))
         for i in range(1, n_layers - 1):
             self.layers.append(dglnn.SAGEConv(n_hidden, n_hidden, 'mean'))
@@ -88,6 +89,7 @@ class SAGE(nn.Module):
             if l != len(self.layers) - 1:
                 h = self.activation(h)
                 h = self.dropout(h)
+            # 并没有实际构建一个局部网络，而是通过指定参与消息传递的结点和传递方向实现采样网络功能
         return h
 
     def inference(self, g, x, batch_size, device):
@@ -105,12 +107,14 @@ class SAGE(nn.Module):
         # TODO: can we standardize this?
         nodes = th.arange(g.number_of_nodes())
         for l, layer in enumerate(self.layers):
-            y = th.zeros(g.number_of_nodes(), self.n_hidden if l != len(self.layers) - 1 else self.n_classes)
+            y = th.zeros(g.number_of_nodes(), self.n_hidden if l !=
+                         len(self.layers) - 1 else self.n_classes)
 
             for start in tqdm.trange(0, len(nodes), batch_size):
                 end = start + batch_size
                 batch_nodes = nodes[start:end]
-                block = dgl.to_block(dgl.in_subgraph(g, batch_nodes), batch_nodes)
+                block = dgl.to_block(dgl.in_subgraph(
+                    g, batch_nodes), batch_nodes)
                 input_nodes = block.srcdata[dgl.NID]
 
                 h = x[input_nodes].to(device)
@@ -121,6 +125,8 @@ class SAGE(nn.Module):
                     h = self.dropout(h)
 
                 y[start:end] = h.cpu()
+
+                # 这个地方只用了一阶邻居，而且全部计算成本很大，未来需要改进一下
 
             x = y
         return y
@@ -178,12 +184,13 @@ def main(args):
     else:
         device = th.device('cpu')
 
-    # load data
+    # Step.1 load and preprocess dataset，这部分和没有sample时无区别
     print('----loading dataset----')
     dataset = DglNodePropPredDataset(name='ogbn-products')
     dataset_name = dataset.name
     dataset_task = dataset.task_type
-    print('>>> dataset loaded, name: {}, task: {}'.format(dataset_name, dataset_task))
+    print('>>> dataset loaded, name: {}, task: {}'.format(
+        dataset_name, dataset_task))
 
     print('----processing data for training----')
     g = dataset.graph[0]
@@ -231,29 +238,48 @@ def main(args):
            val_mask.int().sum().item(),
            test_mask.int().sum().item()))
 
-    # 转为herograph，否则和采样器的api对不起来
+    # Step.2 配置采样器
+
+    # 将图转为herograph，否则和采样器的api对不起来
     g = dgl.graph(g.all_edges())
     g.ndata['features'] = features
+
+    def prepare_mp(g):
+        """
+        Explicitly materialize the CSR, CSC and COO representation of the given graph
+        so that they could be shared via copy-on-write to sampler workers and GPU
+        trainers.
+        This is a workaround before full shared memory support on heterogeneous graphs.
+        """
+        g.in_degree(0)
+        g.out_degree(0)
+        g.find_edges([0])
     prepare_mp(g)
 
     # Create sampler
-    sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')])
+    sampler = NeighborSampler(g, [int(fanout)
+                                  for fanout in args.fan_out.split(',')])
 
     # Create PyTorch DataLoader for constructing blocks
     dataloader = DataLoader(
         dataset=train_nid.numpy(),
         batch_size=args.batch_size,
-        collate_fn=sampler.sample_blocks,
+        collate_fn=sampler.sample_blocks,  # 采样函数
         shuffle=True,
         drop_last=False,
-        num_workers=args.num_workers)  # 此配置了并行采样
+        num_workers=args.num_workers)  # 此处配置了并行采样
+
+    # Step.3 配置模型、loss function和optimizer
 
     # Define model and optimizer
-    model = SAGE(in_feats, args.num_hidden, n_classes, args.num_layers, F.relu, args.dropout)
+    model = SAGE(in_feats, args.num_hidden, n_classes,
+                 args.num_layers, F.relu, args.dropout)
     model = model.to(device)
     loss_fcn = nn.CrossEntropyLoss()
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Step.4 批处理训练（batch）
 
     # Training loop
     avg = 0
@@ -265,16 +291,14 @@ def main(args):
         for step, blocks in enumerate(dataloader):
             tic_step = time.time()
 
-            '''
-            此处才真正组成子网，进行minibatch训练
-            '''
             # The nodes for input lies at the LHS side of the first block.
             # The nodes for output lies at the RHS side of the last block.
-            input_nodes = blocks[0].srcdata[dgl.NID]
-            seeds = blocks[-1].dstdata[dgl.NID]
+            input_nodes = blocks[0].srcdata[dgl.NID]  # 所有seed+邻居的ID
+            seeds = blocks[-1].dstdata[dgl.NID]  # 采样seed的ID
 
             # Load the input features as well as output labels
-            batch_inputs, batch_labels = load_subtensor(g, labels, seeds, input_nodes, device)
+            batch_inputs, batch_labels = load_subtensor(
+                g, labels, seeds, input_nodes, device)
 
             # Compute loss and prediction
             batch_pred = model(blocks, batch_inputs)
@@ -286,7 +310,8 @@ def main(args):
             iter_tput.append(len(seeds) / (time.time() - tic_step))
             if step % args.log_every == 0:
                 acc = compute_acc(batch_pred, batch_labels)
-                gpu_mem_alloc = th.cuda.max_memory_allocated() / 1000000 if th.cuda.is_available() else 0
+                gpu_mem_alloc = th.cuda.max_memory_allocated(
+                ) / 1000000 if th.cuda.is_available() else 0
                 print(
                     'Epoch {:05d} | Step {:05d} | Loss {:.4f} | Train Acc {:.4f} | Speed (samples/sec) {:.4f} | GPU {:.1f} MiB'.format(
                         epoch, step, loss.item(), acc.item(), np.mean(iter_tput[3:]), gpu_mem_alloc))
@@ -296,12 +321,15 @@ def main(args):
         if epoch >= 5:
             avg += toc - tic
         if epoch % args.eval_every == 0 and epoch != 0:
-            eval_acc = evaluate(model, g, g.ndata['features'], labels, val_mask, args.batch_size, device)
+            eval_acc = evaluate(
+                model, g, g.ndata['features'], labels, val_mask, args.batch_size, device)
             print('Eval Acc {:.4f}'.format(eval_acc))
 
-    test_acc = evaluate(model, g, g.ndata['features'], labels, test_mask, args.batch_size, device)
+    test_acc = evaluate(
+        model, g, g.ndata['features'], labels, test_mask, args.batch_size, device)
     print('Test Acc {:.4f}'.format(test_acc))
-    full_acc = evaluate(model, g, g.ndata['features'], labels, full_mask, args.batch_size, device)
+    full_acc = evaluate(
+        model, g, g.ndata['features'], labels, full_mask, args.batch_size, device)
     print('Full Acc {:.4f}'.format(full_acc))
     print('Avg epoch time: {}'.format(avg / (epoch - 4)))
 
@@ -313,7 +341,7 @@ if __name__ == '__main__':
     argparser.add_argument('--num-epochs', type=int, default=20)
     argparser.add_argument('--num-hidden', type=int, default=16)
     argparser.add_argument('--num-layers', type=int, default=1)
-    argparser.add_argument('--fan-out', type=str, default='10,25')
+    argparser.add_argument('--fan-out', type=str, default='10,25')  # 每一层采样的规模
     argparser.add_argument('--batch-size', type=int, default=1000)
     argparser.add_argument('--log-every', type=int, default=20)
     argparser.add_argument('--eval-every', type=int, default=5)
@@ -321,6 +349,7 @@ if __name__ == '__main__':
     argparser.add_argument('--dropout', type=float, default=0.5)
     argparser.add_argument('--num-workers', type=int, default=0,
                            help="Number of sampling processes. Use 0 for no extra process.")
+    # 此处可调整多线程采样
     args = argparser.parse_args()
 
     main(args)
